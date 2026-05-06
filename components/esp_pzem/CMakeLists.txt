@@ -1,0 +1,9 @@
+idf_component_register(
+    SRCS
+        "src/pzem004t_v1.c"
+    INCLUDE_DIRS 
+        "include"
+    REQUIRES 
+        log 
+        driver
+)
