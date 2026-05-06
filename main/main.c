@@ -1,14 +1,13 @@
 /**
  * @file main.c
- * @brief Application entry point – relay control for fan and bulb.
+ * @brief Application entry point – commercial‑style occupancy lighting & fan control.
  *
  * =============================================================================
  * ARCHITECTURAL ROLE
  * =============================================================================
- * This module lives at the application layer (main component). It directly
- * reads GPIOs and drives relays. In a full layered architecture the relay
- * actions would be commands issued by a core service, but for this
- * self‑contained demo the logic is kept local and deterministic.
+ * Application layer. Reads physical inputs (buttons, PIR) and drives relay
+ * outputs. The logic is contained in a deterministic finite‑state machine and
+ * manual‑override manager. All timing values are configurable at the top.
  * =============================================================================
  */
 
@@ -24,24 +23,27 @@
 /*===========================================================================
  * GPIO PIN ASSIGNMENTS
  *===========================================================================*/
-#define BUTTON_GPIO         0       /**< BOOT button (active low, internal pull‑up) */
+#define BUTTON_FAN_GPIO     0       /**< Fan toggle button (active low, internal pull‑up) */
 #define RELAY_FAN_GPIO      4       /**< Fan relay (active low) */
+#define BUTTON_BULB_GPIO    32      /**< Bulb manual toggle button (active low, internal pull‑up) */
 #define PIR_GPIO            23      /**< PIR motion sensor (active high) */
 #define RELAY_BULB_GPIO     2       /**< Bulb relay (active low) */
 
 /*===========================================================================
  * TIMING CONFIGURATION (all values in milliseconds)
  *===========================================================================*/
-#define BUTTON_DEBOUNCE_MS      20      /**< Button debounce period */
-#define PIR_DEBOUNCE_MS         50      /**< Raw PIR signal debounce */
-#define PIR_CONFIRM_ON_MS       200     /**< Motion must persist this long before turning ON */
-#define PIR_HOLD_ON_MS          4000   /**< Bulb stays ON at least this long after last motion */
-#define PIR_CONFIRM_OFF_MS      200     /**< Absence must persist this long before turning OFF */
+#define BUTTON_DEBOUNCE_MS          20      /**< Button debounce period */
+#define PIR_DEBOUNCE_MS             50      /**< Raw PIR signal debounce */
+#define PIR_CONFIRM_ON_MS           200     /**< Motion must persist this long before turning ON */
+#define PIR_HOLD_ON_MS              4000    /**< Bulb stays ON at least this long after last motion */
+#define PIR_CONFIRM_OFF_MS          200     /**< Absence must persist this long before turning OFF */
+#define PIR_MANUAL_OFF_LOCKOUT_MS   5000    /**< After manual OFF, PIR is frozen for this long */
+#define PIR_MANUAL_ON_TIMEOUT_MS    0       /**< 0 = manual ON stays forever; else auto‑return after this */
 
-#define POLL_PERIOD_MS          10      /**< Main loop polling interval */
+#define POLL_PERIOD_MS              10      /**< Main loop polling interval */
 
 /*===========================================================================
- * PIR STATE MACHINE ENUM
+ * PIR STATE MACHINE
  *===========================================================================*/
 typedef enum {
     PIR_STATE_IDLE,            /**< No motion, bulb off */
@@ -57,21 +59,24 @@ typedef struct {
 } pir_fsm_t;
 
 /*===========================================================================
- * PRIVATE HELPER: initialise GPIOs
+ * PRIVATE HELPERS
  *===========================================================================*/
+/**
+ * @brief Configure all GPIOs (inputs with pull‑ups, relays as outputs).
+ */
 static void gpio_init(void)
 {
     gpio_config_t io_conf = {0};
 
-    /* Button input (pressed = LOW) */
-    io_conf.pin_bit_mask = (1ULL << BUTTON_GPIO);
+    /* Buttons (pressed = LOW) */
+    io_conf.pin_bit_mask = (1ULL << BUTTON_FAN_GPIO) | (1ULL << BUTTON_BULB_GPIO);
     io_conf.mode         = GPIO_MODE_INPUT;
     io_conf.pull_up_en   = GPIO_PULLUP_ENABLE;
     io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
     io_conf.intr_type    = GPIO_INTR_DISABLE;
     gpio_config(&io_conf);
 
-    /* PIR input (active HIGH, weak internal pull‑down for safety) */
+    /* PIR input (active HIGH, weak internal pull‑down) */
     io_conf.pin_bit_mask = (1ULL << PIR_GPIO);
     io_conf.mode         = GPIO_MODE_INPUT;
     io_conf.pull_up_en   = GPIO_PULLUP_DISABLE;
@@ -91,6 +96,33 @@ static void gpio_init(void)
     gpio_set_level(RELAY_BULB_GPIO, 1);
 }
 
+/**
+ * @brief Simple debounced button state reader.
+ *
+ * @param raw           Current raw GPIO level.
+ * @param last_reading  Pointer to last raw reading.
+ * @param last_change   Pointer to tick of last level change.
+ * @param last_steady   Pointer to the debounced stable level.
+ * @param now           Current tick count.
+ * @return true if the debounced level just changed (edge detected).
+ */
+static bool button_debounce(int raw, bool *last_reading, TickType_t *last_change,
+                            bool *last_steady, TickType_t now)
+{
+    bool edge = false;
+    if (raw != *last_reading) {
+        *last_change = now;
+    }
+    if ((now - *last_change) >= pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS)) {
+        if (raw != *last_steady) {
+            *last_steady = raw;
+            edge = true;    // debounced state changed
+        }
+    }
+    *last_reading = raw;
+    return edge;
+}
+
 /*===========================================================================
  * APPLICATION ENTRY
  *===========================================================================*/
@@ -98,116 +130,178 @@ void app_main(void)
 {
     gpio_init();
 
-    /* ----- Button (fan toggle) state variables ----- */
-    bool        fan_on             = false;
-    TickType_t  btn_last_change    = 0;
-    bool        btn_last_steady    = true;   // button not pressed
-    bool        btn_last_reading   = true;
+    /* --- Fan button state --- */
+    bool        fan_on            = false;
+    TickType_t  fan_btn_change    = 0;
+    bool        fan_btn_steady    = true;   // not pressed
+    bool        fan_btn_reading   = true;
 
-    /* ----- PIR state machine instance ----- */
+    /* --- Bulb button state (manual override) --- */
+    TickType_t  bulb_btn_change    = 0;
+    bool        bulb_btn_steady    = true;
+    bool        bulb_btn_reading   = true;
+
+    /* --- Manual control flags & timers --- */
+    bool        bulb_manual_on    = false;    // true = button forced bulb ON
+    TickType_t  lockout_until     = 0;        // PIR frozen until this tick (after manual off)
+    TickType_t  manual_on_timeout = 0;        // if >0, auto‑return to auto at this tick
+
+    /* --- PIR state machine instance --- */
     pir_fsm_t pir = {
         .state        = PIR_STATE_IDLE,
         .state_entry  = 0,
         .last_motion  = 0
     };
+    bool pir_on_request = false;   // PIR FSM demand
 
-    /* ----- PIR debounce variables (raw signal) ----- */
+    /* --- PIR raw signal debounce --- */
     TickType_t  pir_debounce_time = 0;
-    bool        pir_stable        = false;   // debounced, stable level
-    bool        pir_last_reading  = false;
+    bool        pir_stable        = false;
+    bool        pir_reading       = false;
 
-    ESP_LOGI(TAG, "System ready. Button toggles fan (GPIO%d), PIR controls bulb (GPIO%d).",
-             RELAY_FAN_GPIO, RELAY_BULB_GPIO);
+    ESP_LOGI(TAG, "System ready. Fan btn: GPIO%d, Bulb btn: GPIO%d, PIR: GPIO%d",
+             BUTTON_FAN_GPIO, BUTTON_BULB_GPIO, PIR_GPIO);
 
     while (1) {
         TickType_t now = xTaskGetTickCount();
 
-        /*---------------------------------------------------------------------
-         * BUTTON HANDLING – simple debounced toggle
-         *---------------------------------------------------------------------*/
-        bool btn_raw = gpio_get_level(BUTTON_GPIO);
-        if (btn_raw != btn_last_reading) {
-            btn_last_change = now;
+        /*------------------------------------------------------------------
+         * FAN BUTTON – simple toggle
+         *------------------------------------------------------------------*/
+        int fan_btn_raw = gpio_get_level(BUTTON_FAN_GPIO);
+        bool fan_edge = button_debounce(fan_btn_raw, &fan_btn_reading,
+                                        &fan_btn_change, &fan_btn_steady, now);
+        if (fan_edge && fan_btn_steady == 0) {   // falling edge (press)
+            fan_on = !fan_on;
+            gpio_set_level(RELAY_FAN_GPIO, fan_on ? 0 : 1);
+            ESP_LOGI(TAG, "Fan %s", fan_on ? "ON" : "OFF");
         }
-        if ((now - btn_last_change) >= pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS)) {
-            if (btn_raw != btn_last_steady) {
-                btn_last_steady = btn_raw;
-                if (btn_raw == 0) {      // falling edge = press
-                    fan_on = !fan_on;
-                    gpio_set_level(RELAY_FAN_GPIO, fan_on ? 0 : 1);
-                    ESP_LOGI(TAG, "Fan %s", fan_on ? "ON" : "OFF");
+
+        /*------------------------------------------------------------------
+         * BULB BUTTON – manual override toggle
+         *------------------------------------------------------------------*/
+        int bulb_btn_raw = gpio_get_level(BUTTON_BULB_GPIO);
+        bool bulb_edge = button_debounce(bulb_btn_raw, &bulb_btn_reading,
+                                         &bulb_btn_change, &bulb_btn_steady, now);
+        if (bulb_edge && bulb_btn_steady == 0) {   // press
+            if (!bulb_manual_on) {
+                // Toggle ON
+                bulb_manual_on = true;
+                // If manual‑on timeout is enabled, schedule auto‑return
+                if (PIR_MANUAL_ON_TIMEOUT_MS > 0) {
+                    manual_on_timeout = now + pdMS_TO_TICKS(PIR_MANUAL_ON_TIMEOUT_MS);
+                } else {
+                    manual_on_timeout = 0;   // never auto‑return
                 }
+                ESP_LOGI(TAG, "Bulb ON (manual override)");
+            } else {
+                // Toggle OFF
+                bulb_manual_on = false;
+                // Lockout PIR for a while so you can leave without re‑trigger
+                lockout_until = now + pdMS_TO_TICKS(PIR_MANUAL_OFF_LOCKOUT_MS);
+                // Reset PIR state machine to idle (ignore any pending motion)
+                pir.state = PIR_STATE_IDLE;
+                pir_on_request = false;
+                ESP_LOGI(TAG, "Bulb OFF (manual override, lockout %d ms)",
+                         PIR_MANUAL_OFF_LOCKOUT_MS);
             }
         }
-        btn_last_reading = btn_raw;
 
-        /*---------------------------------------------------------------------
-         * PIR RAW SIGNAL DEBOUNCE (independent of state machine)
-         *---------------------------------------------------------------------*/
+        /*------------------------------------------------------------------
+         * MANUAL‑ON AUTO‑RETURN (if configured)
+         *------------------------------------------------------------------*/
+        if (bulb_manual_on && manual_on_timeout != 0 && now >= manual_on_timeout) {
+            bulb_manual_on = false;
+            // After auto‑return, lockout the PIR briefly (same as manual off)
+            lockout_until = now + pdMS_TO_TICKS(PIR_MANUAL_OFF_LOCKOUT_MS);
+            pir.state = PIR_STATE_IDLE;
+            pir_on_request = false;
+            ESP_LOGI(TAG, "Bulb OFF (manual on timeout expired)");
+        }
+
+        /*------------------------------------------------------------------
+         * PIR RAW SIGNAL DEBOUNCE
+         *------------------------------------------------------------------*/
         bool pir_raw = gpio_get_level(PIR_GPIO);
-        if (pir_raw != pir_last_reading) {
+        if (pir_raw != pir_reading) {
             pir_debounce_time = now;
         }
         if ((now - pir_debounce_time) >= pdMS_TO_TICKS(PIR_DEBOUNCE_MS)) {
-            pir_stable = pir_raw;   // level has been stable long enough
+            pir_stable = pir_raw;   // stable reading
         }
-        pir_last_reading = pir_raw;
+        pir_reading = pir_raw;
 
-        /*---------------------------------------------------------------------
-         * PIR STATE MACHINE
-         *---------------------------------------------------------------------*/
-        switch (pir.state) {
+        /*------------------------------------------------------------------
+         * PIR STATE MACHINE – only active when NOT in lockout
+         *------------------------------------------------------------------*/
+        if (lockout_until == 0 || now >= lockout_until) {
+            // Normal PIR operation
+            switch (pir.state) {
 
-        case PIR_STATE_IDLE:
-            if (pir_stable) {
-                // First sign of motion -> start confirmation timer
-                pir.state = PIR_STATE_CONFIRMING_ON;
-                pir.state_entry = now;
-                ESP_LOGD(TAG, "PIR: motion detected, confirming...");
+            case PIR_STATE_IDLE:
+                if (pir_stable) {
+                    pir.state = PIR_STATE_CONFIRMING_ON;
+                    pir.state_entry = now;
+                    ESP_LOGD(TAG, "PIR: motion detected, confirming...");
+                }
+                break;
+
+            case PIR_STATE_CONFIRMING_ON:
+                if (!pir_stable) {
+                    pir.state = PIR_STATE_IDLE;
+                    ESP_LOGD(TAG, "PIR: false trigger, returning to idle");
+                } else if ((now - pir.state_entry) >= pdMS_TO_TICKS(PIR_CONFIRM_ON_MS)) {
+                    pir_on_request = true;   // demand light ON
+                    pir.last_motion = now;
+                    pir.state = PIR_STATE_ON_TIMER;
+                    ESP_LOGI(TAG, "Bulb ON (motion confirmed)");
+                }
+                break;
+
+            case PIR_STATE_ON_TIMER:
+                if (pir_stable) {
+                    pir.last_motion = now;   // refresh hold timer
+                } else if ((now - pir.last_motion) >= pdMS_TO_TICKS(PIR_HOLD_ON_MS)) {
+                    pir_on_request = false;  // demand light OFF
+                    pir.state = PIR_STATE_CONFIRMING_OFF;
+                    pir.state_entry = now;
+                    ESP_LOGD(TAG, "PIR: hold expired, confirming absence...");
+                }
+                break;
+
+            case PIR_STATE_CONFIRMING_OFF:
+                if (pir_stable) {
+                    // Motion returned -> go straight back to ON
+                    pir_on_request = true;
+                    pir.last_motion = now;
+                    pir.state = PIR_STATE_ON_TIMER;
+                    ESP_LOGI(TAG, "Bulb ON (motion returned)");
+                } else if ((now - pir.state_entry) >= pdMS_TO_TICKS(PIR_CONFIRM_OFF_MS)) {
+                    pir.state = PIR_STATE_IDLE;
+                    ESP_LOGI(TAG, "Bulb OFF (absence confirmed)");
+                }
+                break;
             }
-            break;
-
-        case PIR_STATE_CONFIRMING_ON:
-            if (!pir_stable) {
-                // Motion disappeared before confirmation -> noise, go back
-                pir.state = PIR_STATE_IDLE;
-                ESP_LOGD(TAG, "PIR: false trigger, returning to idle");
-            } else if ((now - pir.state_entry) >= pdMS_TO_TICKS(PIR_CONFIRM_ON_MS)) {
-                // Motion confirmed -> turn bulb ON
-                gpio_set_level(RELAY_BULB_GPIO, 0);
-                pir.last_motion = now;
-                pir.state = PIR_STATE_ON_TIMER;
-                ESP_LOGI(TAG, "Bulb ON (motion confirmed)");
+        } else {
+            // Lockout active: keep PIR idle and demand off
+            pir_on_request = false;
+            if (pir.state != PIR_STATE_IDLE) {
+                pir.state = PIR_STATE_IDLE;   // ensure it's idle
             }
-            break;
-
-        case PIR_STATE_ON_TIMER:
-            if (pir_stable) {
-                // Motion still present -> reset hold timer
-                pir.last_motion = now;
-            } else if ((now - pir.last_motion) >= pdMS_TO_TICKS(PIR_HOLD_ON_MS)) {
-                // No motion for hold time -> start off‑confirmation
-                gpio_set_level(RELAY_BULB_GPIO, 1);    // turn OFF tentatively
-                pir.state = PIR_STATE_CONFIRMING_OFF;
-                pir.state_entry = now;
-                ESP_LOGD(TAG, "PIR: hold expired, confirming absence...");
-            }
-            break;
-
-        case PIR_STATE_CONFIRMING_OFF:
-            if (pir_stable) {
-                // Motion returned during off‑confirmation -> cancel, go back ON
-                gpio_set_level(RELAY_BULB_GPIO, 0);
-                pir.last_motion = now;
-                pir.state = PIR_STATE_ON_TIMER;
-                ESP_LOGI(TAG, "Bulb ON (motion returned)");
-            } else if ((now - pir.state_entry) >= pdMS_TO_TICKS(PIR_CONFIRM_OFF_MS)) {
-                // Confirmed absence -> final OFF
-                pir.state = PIR_STATE_IDLE;
-                ESP_LOGI(TAG, "Bulb OFF (absence confirmed)");
-            }
-            break;
         }
+
+        /*------------------------------------------------------------------
+         * FINAL RELAY CONTROL – combine manual and automatic demands
+         *------------------------------------------------------------------*/
+        bool bulb_on;
+        if (bulb_manual_on) {
+            bulb_on = true;                     // manual override
+        } else if (lockout_until > now) {
+            bulb_on = false;                    // forced off by lockout
+        } else {
+            bulb_on = pir_on_request;           // PIR demand
+        }
+        gpio_set_level(RELAY_BULB_GPIO, bulb_on ? 0 : 1);
 
         vTaskDelay(pdMS_TO_TICKS(POLL_PERIOD_MS));
     }
