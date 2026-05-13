@@ -1,12 +1,12 @@
 /**
  * @file main.c
- * @brief Occupancy controller with LCD2004 – robust relay state tracking.
+ * @brief Occupancy controller + INA219 + GSM alerts.
  *
  * =============================================================================
  * ARCHITECTURAL ROLE
  * =============================================================================
- * Application layer. Deterministic occupancy state machines for bulb & fan,
- * with an LCD displaying the *logical* relay state (immune to GPIO loading).
+ * Application layer. Combines deterministic occupancy state machines,
+ * an INA219 current monitor, and a GSM module for event notifications.
  * =============================================================================
  */
 
@@ -20,6 +20,7 @@
 #include "esp_log.h"
 #include "lcd_i2c.h"
 #include "ina219.h"
+#include "gsm_sim800.h"
 
 #define TAG "main"
 
@@ -44,9 +45,21 @@
 #define PIR_MANUAL_ON_TIMEOUT_MS        0
 #define POLL_PERIOD_MS                  10
 #define LCD_UPDATE_MS                   500
+#define GSM_CHECK_MS                    5000
 
 /*===========================================================================
- * OCCUPANCY STATE MACHINE
+ * GSM CONFIGURATION
+ *===========================================================================*/
+#define GSM_TX_PIN              17
+#define GSM_RX_PIN              16
+#define GSM_UART_NUM            UART_NUM_2
+#define GSM_BAUD_RATE           9600
+
+#define NOTIFY_PHONE            "+255688173415"   // change to your number
+#define SMS_PASSWORD            "SECRET123"
+
+/*===========================================================================
+ * OCCUPANCY STATE MACHINE (identical to working version)
  *===========================================================================*/
 typedef enum {
     OCC_STATE_IDLE,
@@ -67,8 +80,8 @@ typedef struct {
     TickType_t  btn_change;
     bool        btn_steady;
     bool        btn_reading;
-    bool        demand;            /**< true = automation wants relay ON */
-    bool        relay_on;          /**< actual relay state (active‑low: true = LOW) */
+    bool        demand;
+    bool        relay_on;
     const char *name;
 } occ_controller_t;
 
@@ -135,10 +148,17 @@ static void occ_handle_button(occ_controller_t *occ, TickType_t now) {
         occ->manual_timeout = (PIR_MANUAL_ON_TIMEOUT_MS > 0)
                 ? now + pdMS_TO_TICKS(PIR_MANUAL_ON_TIMEOUT_MS) : 0;
         ESP_LOGI(TAG, "%s ON (manual)", occ->name);
+        // Notify via SMS
+        char msg[64];
+        snprintf(msg, sizeof(msg), "%s manually turned ON", occ->name);
+        gsm_send_sms_async(NOTIFY_PHONE, msg);
     } else {
         occ->manual_on = false;
         occ_reset(occ, now, PIR_MANUAL_OFF_LOCKOUT_MS);
         ESP_LOGI(TAG, "%s OFF (manual, lockout %dms)", occ->name, PIR_MANUAL_OFF_LOCKOUT_MS);
+        char msg[64];
+        snprintf(msg, sizeof(msg), "%s manually turned OFF", occ->name);
+        gsm_send_sms_async(NOTIFY_PHONE, msg);
     }
 }
 
@@ -147,6 +167,9 @@ static void occ_check_manual_timeout(occ_controller_t *occ, TickType_t now) {
         occ->manual_on = false;
         occ_reset(occ, now, PIR_MANUAL_OFF_LOCKOUT_MS);
         ESP_LOGI(TAG, "%s OFF (manual timeout)", occ->name);
+        char msg[64];
+        snprintf(msg, sizeof(msg), "%s auto OFF (manual timeout)", occ->name);
+        gsm_send_sms_async(NOTIFY_PHONE, msg);
     }
 }
 
@@ -157,6 +180,7 @@ static void occ_state_machine(occ_controller_t *occ, bool pir_stable, TickType_t
         return;
     }
 
+    bool old_demand = occ->demand;
     switch (occ->state) {
     case OCC_STATE_IDLE:
         if (pir_stable) {
@@ -193,11 +217,15 @@ static void occ_state_machine(occ_controller_t *occ, bool pir_stable, TickType_t
         }
         break;
     }
+
+    /* Send SMS on automatic state change */
+    if (old_demand != occ->demand && !occ->manual_on) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "%s %s (auto)", occ->name, occ->demand ? "ON" : "OFF");
+        gsm_send_sms_async(NOTIFY_PHONE, msg);
+    }
 }
 
-/**
- * @brief Update the physical relay and store its logical state.
- */
 static void occ_update_relay(occ_controller_t *occ) {
     bool on;
     if (occ->manual_on) {
@@ -207,14 +235,12 @@ static void occ_update_relay(occ_controller_t *occ) {
     } else {
         on = occ->demand;
     }
-    // Write to relay (active low: 0 = ON)
     gpio_set_level(occ->relay_pin, on ? 0 : 1);
-    // Store the logical state (what the relay is supposed to be)
     occ->relay_on = on;
 }
 
 /*===========================================================================
- * LCD2004 WRAPPER (your proven driver)
+ * LCD2004 WRAPPER
  *===========================================================================*/
 static lcd_handle_t *lcd = NULL;
 
@@ -248,55 +274,23 @@ static void lcd_setup(void) {
     }
 }
 
-/**
- * @brief Update LCD with LOGICAL relay states (reliable).
- */
 static void lcd_status_update(occ_controller_t *bulb, occ_controller_t *fan,
                               bool motion_now, const ina219_data_t *ina) {
     if (!lcd) return;
 
-    // Line 0: Bulb
     lcd_set_cursor(lcd, 0, 0);
-    lcd_printf(lcd, "BULB: %s  %s",
-               bulb->relay_on ? "ON " : "OFF",
+    lcd_printf(lcd, "BULB: %s  %s", bulb->relay_on ? "ON " : "OFF",
                bulb->manual_on ? "(man)" : "(auto)");
-
-    // Line 1: Fan
     lcd_set_cursor(lcd, 1, 0);
-    lcd_printf(lcd, "FAN:  %s  %s",
-               fan->relay_on ? "ON " : "OFF",
+    lcd_printf(lcd, "FAN:  %s  %s", fan->relay_on ? "ON " : "OFF",
                fan->manual_on ? "(man)" : "(auto)");
-
-    // Line 2: PIR
     lcd_set_cursor(lcd, 2, 0);
     lcd_printf(lcd, "PIR: %s", motion_now ? "MOTION" : "NO MOTION");
-
-    // Line 3: INA219 readings
+    lcd_set_cursor(lcd, 3, 0);
     if (ina) {
-        lcd_set_cursor(lcd, 3, 0);
         lcd_printf(lcd, "V:%05.1fV I:%05.2fA", ina->bus_voltage, ina->current);
     } else {
-        lcd_set_cursor(lcd, 3, 0);
-        lcd_print_str(lcd, "INA219 offline");
-    }
-}
-
-/**
- * @brief Quick I2C scanner for legacy I2C driver.
- *        Prints every device address that responds.
- */
-static void i2c_scan(void) {
-    ESP_LOGI(TAG, "Scanning I2C bus...");
-    for (uint8_t addr = 1; addr < 127; addr++) {
-        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-        i2c_master_start(cmd);
-        i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
-        i2c_master_stop(cmd);
-        esp_err_t err = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(20));
-        i2c_cmd_link_delete(cmd);
-        if (err == ESP_OK) {
-            ESP_LOGI(TAG, "Device found at 0x%02X", addr);
-        }
+        lcd_printf(lcd, "INA219 offline");
     }
 }
 
@@ -309,20 +303,34 @@ void app_main(void) {
     button_input_init(BUTTON_FAN_GPIO);
     lcd_setup();
 
-    /* --- INA219 initialisation --- */
+    /* INA219 (addr 0x44 as scanned) */
     ina219_config_t ina_cfg = {
         .i2c_addr = 0x44,
-        .shunt_resistance = 0.1f,   // typical for INA219 breakout
+        .shunt_resistance = 0.1f,
         .max_current = 3.2f
     };
-    
-    // i2c_scan(); // Uncomment to scan for I2C devices on the bus
-    if (ina219_init(&ina_cfg) != ESP_OK) {
-        ESP_LOGE(TAG, "INA219 init failed");
+    bool ina_ok = (ina219_init(&ina_cfg) == ESP_OK);
+    if (!ina_ok) ESP_LOGE(TAG, "INA219 init failed");
+
+    /* GSM SIM800 */
+    gsm_config_t gsm_cfg = {
+        .uart_port   = GSM_UART_NUM,
+        .tx_pin      = GSM_TX_PIN,
+        .rx_pin      = GSM_RX_PIN,
+        .baud_rate   = GSM_BAUD_RATE,
+        .buf_size    = 2048,
+        .timeout_ms  = 30000,
+        .retry_count = 2,
+    };
+    if (gsm_init(&gsm_cfg) != ESP_OK) {
+        ESP_LOGE(TAG, "GSM init failed – SMS alerts disabled");
     } else {
-        ESP_LOGI(TAG, "INA219 ready");
+        ESP_LOGI(TAG, "GSM ready, sending startup message");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        gsm_send_sms(NOTIFY_PHONE, "System started. Bulb & Fan automation active.", 35000);
     }
 
+    /* Occupancy controllers */
     occ_controller_t bulb = {
         .state = OCC_STATE_IDLE, .state_entry = 0, .last_motion = 0,
         .manual_on = false, .lockout_until = 0, .manual_timeout = 0,
@@ -340,64 +348,40 @@ void app_main(void) {
 
     TickType_t pir_debounce_time = 0;
     bool pir_stable = false, pir_last_reading = false;
-    TickType_t last_lcd = 0;
-
-    ESP_LOGI(TAG, "System ready");
+    TickType_t last_lcd = 0, last_gsm_check = 0;
 
     while (1) {
         TickType_t now = xTaskGetTickCount();
 
-        /* PIR raw debounce */
         bool pir_raw = gpio_get_level(PIR_GPIO);
         if (pir_raw != pir_last_reading) pir_debounce_time = now;
         if ((now - pir_debounce_time) >= pdMS_TO_TICKS(PIR_DEBOUNCE_MS))
             pir_stable = pir_raw;
         pir_last_reading = pir_raw;
 
-        /* Bulb controller */
         occ_handle_button(&bulb, now);
         occ_check_manual_timeout(&bulb, now);
         occ_state_machine(&bulb, pir_stable, now);
         occ_update_relay(&bulb);
 
-        /* Fan controller */
         occ_handle_button(&fan, now);
         occ_check_manual_timeout(&fan, now);
         occ_state_machine(&fan, pir_stable, now);
         occ_update_relay(&fan);
 
-        static ina219_data_t ina_data;
-        static bool ina_ok = false;
-
-        /* LCD refresh using logical states */
-        #if 0
-
-            // here the sensor not connected, so just show "offline" message
-            if (lcd && (now - last_lcd) >= pdMS_TO_TICKS(LCD_UPDATE_MS)) {
-                lcd_status_update(&bulb, &fan, pir_stable, NULL); /**< TODO: Pass INA219 data */
-                last_lcd = now;
-            }
-
-        #else
-
-            // In a real system, reading INA219 here and passing the data to lcd_status_update.
-            if (lcd && (now - last_lcd) >= pdMS_TO_TICKS(LCD_UPDATE_MS)) {
-                ina_ok = (ina219_read(&ina_data) == ESP_OK);
-                lcd_status_update(&bulb, &fan, pir_stable, ina_ok ? &ina_data : NULL);
-                last_lcd = now;
-            }
-        #endif
-
-        ina_ok = false;
-        if ((now - last_lcd) >= pdMS_TO_TICKS(LCD_UPDATE_MS)) {
-            // Attempt to read INA219 (will fail gracefully if not initialised)
-            if (ina219_read(&ina_data) == ESP_OK) {
-                ina_ok = true;
-            } else {
-                ina_ok = false;
-            }
-            if (lcd) lcd_status_update(&bulb, &fan, pir_stable, ina_ok ? &ina_data : NULL);
+        if (lcd && (now - last_lcd) >= pdMS_TO_TICKS(LCD_UPDATE_MS)) {
+            ina219_data_t ina_data;
+            bool ina_read_ok = (ina_ok && ina219_read(&ina_data) == ESP_OK);
+            lcd_status_update(&bulb, &fan, pir_stable,
+                             ina_read_ok ? &ina_data : NULL);
             last_lcd = now;
+        }
+
+        /* GSM SMS check & processing */
+        if (gsm_is_ready() && (now - last_gsm_check) >= pdMS_TO_TICKS(GSM_CHECK_MS)) {
+            gsm_check_sms(true);
+            gsm_process_received_sms();
+            last_gsm_check = now;
         }
 
         vTaskDelay(pdMS_TO_TICKS(POLL_PERIOD_MS));

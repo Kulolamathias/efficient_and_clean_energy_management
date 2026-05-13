@@ -8,7 +8,7 @@ idf_component_register(
     REQUIRES
         electrical_param_sensor
         gsm_sim800
-        esp_pzem
+        # esp_pzem
         lcd_i2c
         driver
 )
