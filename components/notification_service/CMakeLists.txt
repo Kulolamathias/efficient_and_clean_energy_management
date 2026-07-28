@@ -1,0 +1,12 @@
+idf_component_register(
+    SRCS
+        "src/notification_service.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        app_config
+        control_service
+        energy_service
+        esp_timer
+        gsm_sim800
+)

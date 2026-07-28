@@ -1,0 +1,12 @@
+idf_component_register(
+    SRCS
+        "main.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        app_config
+        control_service
+        monitoring_service
+        notification_service
+        nvs_flash
+)

@@ -1,0 +1,13 @@
+idf_component_register(
+    SRCS
+        "src/monitoring_service.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        app_config
+        control_service
+        display_service
+        driver
+        energy_service
+        esp_timer
+)

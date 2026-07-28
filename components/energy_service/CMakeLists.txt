@@ -1,0 +1,10 @@
+idf_component_register(
+    SRCS
+        "src/energy_service.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        app_config
+        electrical_param_sensor
+        nvs_flash
+)

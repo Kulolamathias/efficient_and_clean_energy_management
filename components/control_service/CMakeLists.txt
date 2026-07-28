@@ -1,0 +1,10 @@
+idf_component_register(
+    SRCS
+        "src/control_service.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        app_config
+        driver
+        esp_timer
+)
